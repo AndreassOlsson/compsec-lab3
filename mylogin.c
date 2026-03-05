@@ -1,68 +1,97 @@
+/*
+ * mylogin.c — Simple login program (final version)
+ * Compile: gcc -o mylogin mylogin.c pwdblib.c -lcrypt
+ */
+
 #define _XOPEN_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>  /* Behövs för getpass */
-#include <crypt.h>   /* Behövs för crypt */
-#include "pwdblib.h" /* Inkludera header för pwdblib.c */
+#include <unistd.h>
+#include <crypt.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include <signal.h>
+#include "pwdblib.h"
 
 #define USERNAME_SIZE (32)
+#define MAX_FAILED_ATTEMPTS (3)
+#define PASSWORD_AGE_LIMIT (5)
 
-/* * Funktion för att starta användarens skal.
- * Hanterar fork, setgid, setuid och execl.
- * Motsvarar Prep 6 och Problem 10-11.
- */
-void start_shell_session(struct pwdb_passwd *p)
+void read_username(char *username)
 {
-    printf("User authenticated successfully. Starting shell...\n");
+    printf("login: ");
+    if (fgets(username, USERNAME_SIZE, stdin) == NULL)
+    {
+        clearerr(stdin); // Clear errors
+        username[0] = '\0';
+        printf("\n");
+        return;
+    }
+    size_t len = strlen(username);
+    if (len > 0 && username[len - 1] == '\n')
+    {
+        username[len - 1] = '\0'; // strip newline
+    }
+}
 
+int verify_password(const char *password, const char *stored_hash)
+{
+    char salt[3];                  // 2 chars for salt + null terminator
+    strncpy(salt, stored_hash, 2); // Extract the 2-character salt
+    salt[2] = '\0';
+    char *hashed_input = crypt(password, salt); // Hash the input password with the extracted salt
+    return (strcmp(hashed_input, stored_hash) == 0);
+}
+
+int is_account_locked(const struct pwdb_passwd *p)
+{
+    return (p->pw_failed > MAX_FAILED_ATTEMPTS);
+}
+
+void handle_failed_login(struct pwdb_passwd *p)
+{
+    if (p != NULL)
+    {
+        p->pw_failed++;
+        if (pwdb_update_user(p) != 0)
+        {
+            printf("Error updating user database.\n");
+        }
+    }
+    printf("Unknown user or incorrect password.\n");
+}
+
+void start_user_shell(const struct pwdb_passwd *p)
+{
     pid_t pid = fork();
 
     if (pid < 0)
     {
-        perror("Fork failed");
+        perror("fork failed");
     }
     else if (pid == 0)
     {
-        /* Barnprocessen */
-
-        /* Byt till användarens Group ID och User ID */
-        /* VIKTIGT: setgid måste göras innan setuid annars förloras rättigheter för tidigt */
-        if (setgid(p->pw_gid) != 0)
+        if (setgid(p->pw_gid) != 0) // set group ID of the calling process
         {
             perror("setgid failed");
+            _exit(1);
         }
-        if (setuid(p->pw_uid) != 0)
+        if (setuid(p->pw_uid) != 0) // set user ID of the calling process
         {
             perror("setuid failed");
+            _exit(1);
         }
-
-        /* Starta skalet enligt instruktionerna*/
         execl(p->pw_shell, p->pw_shell, NULL);
-
-        /* Om execl misslyckas: */
-        perror("Exec failed");
-        exit(1);
+        perror("execl failed");
+        _exit(1);
     }
     else
     {
-        /* Förälderprocessen */
-        /* Väntar bara tills barnet avslutas (Alltså användare t.ex donald loggar ut)  */
         wait(NULL);
-        printf("Child exited. Returning to login prompt...\n");
     }
 }
 
-/*
- * Hanterar logik vid lyckad inloggning:
- * - Nollställer pw_failed
- * - Ökar pw_age
- * - Sparar till filen pwfile
- * - Startar skalet
- */
 void handle_successful_login(struct pwdb_passwd *p)
 {
     p->pw_failed = 0;
@@ -73,62 +102,20 @@ void handle_successful_login(struct pwdb_passwd *p)
         printf("Error updating user database.\n");
     }
 
-    /* Varna om lösenordet är gammalt (Alltså någon loggat in fler än 3 gånger)*/
-    if (p->pw_age > 5)
+    if (p->pw_age > PASSWORD_AGE_LIMIT)
     {
-        printf("Warning => Your password is old (%d logins). Please change it!!!!!\n", p->pw_age);
+        printf("Warning: Your password is old (%d logins). Please change it!\n", p->pw_age);
     }
 
-    /* Starta skalet */
-    start_shell_session(p);
-}
-
-/*
- * Hanterar logik vid misslyckad inloggning:
- * - Ökar pw_failed
- * - Sparar till pwfile
- */
-void handle_failed_login(struct pwdb_passwd *p)
-{
-    if (p != NULL)
-    {
-        p->pw_failed++;
-        pwdb_update_user(p);
-    }
-    printf("Unknown user or incorrect password.\n");
-}
-
-void read_username(char *username)
-{
-    printf("login: ");
-    if (fgets(username, USERNAME_SIZE, stdin) == NULL)
-    {
-        clearerr(stdin); /*Gör så att ctrl-c inte kraschar programmet*/
-        username[0] = '\0';
-        printf("\n");
-        return;
-    }
-
-    /*Här tvättar vi bort enter tryckingen alltså '\n'*/
-    size_t len = strlen(username);
-    if (len > 0 && username[len - 1] == '\n')
-    {
-        username[len - 1] = '\0';
-    }
+    printf("User authenticated successfully. Starting shell...\n");
+    start_user_shell(p);
 }
 
 int main(int argc, char **argv)
 {
-    /* Ignorera ctrl-c*/
     signal(SIGINT, SIG_IGN);
-
     char username[USERNAME_SIZE];
-    char *password_input;
-    struct pwdb_passwd *p;
-    char salt[3];
-    char *encrypted_input;
 
-    /*Vår main while loop som körs om och om igen*/
     while (1)
     {
         read_username(username);
@@ -138,47 +125,27 @@ int main(int argc, char **argv)
             continue;
         }
 
-        /* Hämta användare först för att kunna kolla om den finns/är låst */
-        p = pwdb_getpwnam(username);
-
-        /* Om användaren inte finns, fråga ändå efter lösenord för att inte avslöja det,
-           men vi kan hantera det enkelt här */
-        password_input = getpass("Password: ");
+        struct pwdb_passwd *p = pwdb_getpwnam(username);
+        char *password = getpass("Password: ");
 
         if (p == NULL)
         {
-            /* Ingen användare hittades */
             handle_failed_login(NULL);
             continue;
         }
 
-        /* Kolla om kontot är låst pga fler än tre felaktiga logins */
-        if (p->pw_failed > 3)
+        if (is_account_locked(p))
         {
-            printf("Account is locked.\n");
+            printf("Account is locked due to too many failed attempts.\n");
             continue;
         }
 
-        /* Autentisering */
-        strncpy(salt, p->pw_passwd, 2);
-        salt[2] = '\0';
-        /*Vi anropar crypt med lösenordet användaren skrev in och saltet vi får från pwfile*/
-        /*Exempel: crypt("quack01", "0B") -> Resultat: 0BWGsAnLYCtBU*/
-        /*Om vi anropar quack01 med inställning 0B blir det alltid 0BWGsAnLYCtBU*/
-        encrypted_input = crypt(password_input, salt);
-
-        /*Här nedan kollar vi om hashen blir korrekt eller inte*/
-        if (strcmp(encrypted_input, p->pw_passwd) == 0)
+        if (verify_password(password, p->pw_passwd))
         {
-            /* Lyckad inloggning */
             handle_successful_login(p);
-
-            /* OBS: Tog bort 'break' här. Enligt manualen ska programmet
-               visa "login:" igen när skalet avslutas.  */
         }
         else
         {
-            /* Misslyckad inloggning */
             handle_failed_login(p);
         }
     }
